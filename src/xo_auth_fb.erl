@@ -1,7 +1,7 @@
 -module(xo_auth_fb).
 -export([handle_fb_req/1]).
 -export([convert_name_to_username/1]).
--include_lib("couch/include/couch_db.hrl").
+-include_lib("couch_db.hrl").
 
 %% This module handles Facebook signin and _user document creation.
 %% The handle_fb_req should be configured to a URI that is passed to Facebook as the
@@ -10,7 +10,7 @@
 
 %% Exported functions
 handle_fb_req(#httpd{method='GET'}=Req) ->
-    try 
+    try
         %% Did we get a 'code' or 'error' back from facebook?
         case couch_httpd:qs_value(Req, "code") of
             undefined ->
@@ -19,13 +19,13 @@ handle_fb_req(#httpd{method='GET'}=Req) ->
                         ?LOG_DEBUG("Facebook responded with something other than a code: ~p", [Req]),
                         couch_httpd:send_json(Req, 403, [], {[{error, <<"No code supplied">>}]});
                     AccessToken ->
-                        [RedirectURI, ClientID, ClientSecret] = 
-                            xo_auth:extract_config_values("fb", ["redirect_uri", "client_id", "client_secret"]),
+                        [ClientID, ClientSecret] =
+                            xo_auth:extract_config_values("fb", ["client_id", "client_secret"]),
 
                         GraphmeResponse = request_facebook_graphme_info(AccessToken),
                         create_or_update_user(Req, ClientID, ClientSecret, AccessToken, GraphmeResponse)
                 end;
-            Code -> 
+            Code ->
                 handle_fb_code(Req, Code)
         end
     catch
@@ -48,16 +48,16 @@ handle_fb_req(Req) ->
 
 handle_fb_code(Req, FBCode) ->
     %% Extract required values from config ini
-    [RedirectURI, ClientID, ClientSecret] = 
+    [RedirectURI, ClientID, ClientSecret] =
         xo_auth:extract_config_values("fb", ["redirect_uri", "client_id", "client_secret"]),
-    
+
     %% if the client passed in a client app token then facebook should have passed it back to us,
     %% so extract it.
     ClientAppToken = case couch_httpd:qs_value(Req, "clientapptoken") of
         undefined -> "";
         Cat -> couch_util:url_encode(Cat)
     end,
-    
+
     %% Get an access token from Facebook
     case request_facebook_access_token(ClientAppToken, RedirectURI, ClientID, ClientSecret, FBCode) of
         {ok, AccessToken} ->
@@ -80,9 +80,8 @@ create_or_update_user(Req, ClientID, ClientSecret, AccessToken, {ok, FacebookUse
              _ ->
                  xo_auth:update_service_details(Username, "facebook", FacebookUserID, [])
          end,
-                 
-    RedirectUri = couch_config:get("fb", "client_app_uri", nil),
-    xo_auth:generate_cookied_response_json(Username, Req, RedirectUri).
+
+    xo_auth:generate_cookied_response_json(Username, Req).
 
 request_facebook_graphme_info(AccessToken) ->
     %% Construct the URL to access the graph API's /me page
@@ -97,7 +96,7 @@ request_facebook_graphme_info(AccessToken) ->
 
 process_facebook_graphme_response(Resp) ->
     %% Extract user facebook id from the body
-    case Resp of 
+    case Resp of
         {ok, "200", _, Body} ->
             %% Decode the facebook response body, extracting the
             %% ID and the complete response.
@@ -139,16 +138,18 @@ request_facebook_access_token(ClientAppToken, RedirectURI, ClientID, ClientSecre
 
 process_facebook_access_token(Resp) ->
     %% Extract the info we need
-    case Resp of 
+    case Resp of
         {ok, "200", _, Body} ->
-            Props = mochiweb_util:parse_qs(Body),
-            case lists:keyfind("access_token", 1, Props) of
-                {_, AccessToken} ->
-                    ?LOG_DEBUG("process_facebook_access_token: access_token=~p",[AccessToken]),
-                    {ok, AccessToken};
-                _ ->
+            {FBInfo}=?JSON_DECODE(Body),
+            % Props = mochiweb_util:parse_qs(Body),
+            % case lists:keyfind("access_token", 1, Props) of
+            case couch_util:get_value(<<"access_token">>, FBInfo) of
+                undefined ->
                     ?LOG_DEBUG("process_facebook_access_token: unexpected response: ~p", [Body]),
-                    {error, "Unexpected body response from facebook"}
+                    {error, "Unexpected body response from facebook"};
+                AccessToken ->
+                    ?LOG_DEBUG("process_facebook_access_token: access_token=~p",[AccessToken]),
+                    {ok, AccessToken}
             end;
         _ ->
             ?LOG_DEBUG("process_facebook_access_token: non 200 response of: ~p", [Resp]),
@@ -156,11 +157,11 @@ process_facebook_access_token(Resp) ->
     end.
 
 request_access_token_extension(ClientID, ClientSecret, Token) ->
-    Url="https://graph.facebook.com/oauth/access_token?client_id=" ++ 
-        ClientID ++ 
-        "&client_secret=" ++ 
+    Url="https://graph.facebook.com/oauth/access_token?client_id=" ++
+        ClientID ++
+        "&client_secret=" ++
         ClientSecret ++
-        "&grant_type=fb_exchange_token&fb_exchange_token=" ++ 
+        "&grant_type=fb_exchange_token&fb_exchange_token=" ++
         Token,
     ?LOG_DEBUG("request_access_token_extension: requesting using URL - ~p", [Url]),
 
@@ -168,22 +169,22 @@ request_access_token_extension(ClientID, ClientSecret, Token) ->
     Resp=ibrowse:send_req(Url, [], get, []),
     ?LOG_DEBUG("Full response from Facebook: ~p", [Resp]),
 
-    case Resp of 
+    case Resp of
         {ok, "200", _, Body} ->
-            Props = mochiweb_util:parse_qs(Body),
-            case lists:keyfind("access_token", 1, Props) of
-                {_, NewAccessToken} ->
-                    ?LOG_DEBUG("process_access_token_extension: access_token=~p",[NewAccessToken]),
-                    {ok, NewAccessToken};
-                _ ->
+            {FBInfo}=?JSON_DECODE(Body),
+            case couch_util:get_value(<<"access_token">>, FBInfo) of
+                undefined ->
                     ?LOG_DEBUG("process_access_token_extension: unexpected response: ~p", [Body]),
-                    throw(could_not_extend_token)
+                    throw(could_not_extend_token);
+                NewAccessToken ->
+                    ?LOG_DEBUG("process_access_token_extension: access_token=~p",[NewAccessToken]),
+                    {ok, NewAccessToken}
             end;
         _ ->
             ?LOG_DEBUG("process_access_token_extension: non 200 response of: ~p", [Resp]),
             throw(could_not_extend_token)
     end.
-    
+
 -define(INVALID_CHARS, "&%+,./:;=?@ <>#%|\\[]{}~^`'").
 
 convert_name_to_username(Name) ->
@@ -197,10 +198,10 @@ convert_name_to_username(Name) ->
                           end,
                           "",
                           string:to_lower(Name)),
-    case Trimmed of 
+    case Trimmed of
         "" -> throw({no_username_possible_from_name, Name});
         Valid -> Valid
     end.
-             
-        
-                             
+
+
+
